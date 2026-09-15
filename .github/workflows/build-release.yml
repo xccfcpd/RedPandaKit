@@ -24,7 +24,8 @@ jobs:
 
     steps:
       - name: Checkout RedPanda-CPP source
-        uses: actions/checkout@v5 # 升级到 v5
+        # 升级到 v5
+        uses: actions/checkout@v5
         with:
           repository: 'xccfcpd/RedPanda-CPP'
           ref: copied-master-plus
@@ -83,15 +84,52 @@ jobs:
           echo "QT_PLUGIN_PATH=$toolchainRoot\plugins" >> $env:GITHUB_ENV
 
       # ==========================================
-      # 5. 编译与安装
+      # 4.5 诊断：确认实际使用的 CMake / Ninja 版本
+      # ==========================================
+      - name: Diagnose CMake and Ninja
+        shell: pwsh
+        run: |
+          Write-Host "===== 当前 PATH 中的 cmake ====="
+          where.exe cmake
+          Write-Host ""
+          Write-Host "===== 当前 PATH 中的 ninja ====="
+          where.exe ninja
+          Write-Host ""
+          Write-Host "===== cmake --version ====="
+          cmake --version
+          Write-Host ""
+          Write-Host "===== ninja --version ====="
+          ninja --version
+          Write-Host ""
+          Write-Host "===== 工具链中自带的 cmake ====="
+          & "${{ github.workspace }}\RedPandaKit\bin\cmake.exe" --version
+          Write-Host ""
+          Write-Host "===== 工具链中自带的 ninja ====="
+          & "${{ github.workspace }}\RedPandaKit\bin\ninja.exe" --version
+
+      # ==========================================
+      # 5. 编译与安装（强制使用工具链里的 CMake / Ninja）
       # ==========================================
       - name: Configure, Build and Install
         shell: pwsh
         working-directory: source
         run: |
+          # 明确指定工具链里的 cmake 和 ninja，避免使用 GitHub 预装版
+          $cmake = "${{ github.workspace }}\RedPandaKit\bin\cmake.exe"
+          $ninja = "${{ github.workspace }}\RedPandaKit\bin\ninja.exe"
+
+          # 打印一下实际使用的路径和版本，便于排查
+          Write-Host "Using CMake: $cmake"
+          Write-Host "Using Ninja: $ninja"
+          & $cmake --version
+          & $ninja --version
+
           mkdir build -Force
           cd build
-          cmake -G Ninja `
+
+          # 配置：显式指定 CMAKE_MAKE_PROGRAM 为工具链里的 ninja
+          & $cmake -G Ninja `
+                -DCMAKE_MAKE_PROGRAM="$ninja" `
                 -DCMAKE_BUILD_TYPE=Release `
                 -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/install" `
                 "-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG" `
@@ -99,8 +137,12 @@ jobs:
                 "-DCMAKE_EXE_LINKER_FLAGS=-static -Wl,--strip-all" `
                 -DCMAKE_PREFIX_PATH="$env:CMAKE_PREFIX_PATH" `
                 ..
-          cmake --build . -j $env:NUMBER_OF_PROCESSORS
-          cmake --install .
+
+          # 编译：使用工具链里的 cmake 驱动 ninja
+          & $cmake --build . -j $env:NUMBER_OF_PROCESSORS
+
+          # 安装
+          & $cmake --install .
 
       # ==========================================
       # 6. 获取版本号与打包
@@ -124,7 +166,8 @@ jobs:
       # 7. 发布 Release
       # ==========================================
       - name: Upload Release
-        uses: softprops/action-gh-release@v3 # 升级到 v3
+        # 升级到 v3
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.gettag.outputs.tag }}
           files: RedPanda-CPP-${{ steps.gettag.outputs.tag }}-win64.zip
