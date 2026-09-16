@@ -23,6 +23,9 @@ jobs:
     runs-on: windows-2022
 
     steps:
+      # ==========================================
+      # 1. Checkout 源码仓库
+      # ==========================================
       - name: Checkout RedPanda-CPP source
         # 升级到 v5
         uses: actions/checkout@v5
@@ -33,29 +36,40 @@ jobs:
           path: source
 
       # ==========================================
-      # 1. 下载工具链
+      # 2. Checkout 工具链仓库（当前仓库）
       # ==========================================
-      - name: Download toolchain
-        shell: pwsh
-        run: |
-          $url = "https://github.com/xccfcpd/RedPandaKit/releases/download/toolchain-1.0/RedPandaKit.7z"
-          Invoke-WebRequest -Uri $url -OutFile RedPandaKit.7z
+      - name: Checkout RedPandaKit toolchain
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          path: kit
 
       # ==========================================
-      # 2. SHA256 校验 (核心安全步骤)
+      # 3. 合并分卷还原成完整的 RedPandaKit.7z
+      #    Windows 的 copy /b 可以二进制合并
+      # ==========================================
+      - name: Merge split archives
+        shell: pwsh
+        run: |
+          Write-Host "合并分卷..."
+          cmd /c copy /b "kit\toolchain\RedPandaKit-split.7z.001" + "kit\toolchain\RedPandaKit-split.7z.002" "RedPandaKit.7z"
+          Write-Host "合并完成"
+
+      # ==========================================
+      # 4. SHA256 校验（跟原来完全一致）
       # ==========================================
       - name: Verify SHA256 checksum
         shell: pwsh
         run: |
           # 重要提示：RedPandaKit.7z的真实 SHA256 哈希值！
           $expectedHash = "f50f0da6bf7911e20773fc164ec9f29455b9cf5913d794876acb7c5d78250d88"
-          
-          # 计算已下载文件的哈希值
+
+          # 计算合并后文件的哈希值
           $actualHash = (Get-FileHash -Path "RedPandaKit.7z" -Algorithm SHA256).Hash
-          
+
           Write-Host "预期哈希值 (Expected): $expectedHash"
           Write-Host "实际哈希值 (Actual):   $actualHash"
-          
+
           # 对比哈希值 (忽略大小写)，如果不一致则报错并强行终止后续步骤
           if ($actualHash -ne $expectedHash) {
             Write-Error "致命错误：RedPandaKit.7z 的 SHA256 校验失败！文件可能已损坏或被篡改。"
@@ -65,7 +79,7 @@ jobs:
           }
 
       # ==========================================
-      # 3. 解压工具链 (只有校验通过才会执行到此步)
+      # 5. 解压工具链（只有校验通过才会执行到此步）
       # ==========================================
       - name: Extract toolchain
         shell: pwsh
@@ -73,7 +87,7 @@ jobs:
           & "C:\Program Files\7-Zip\7z.exe" x RedPandaKit.7z -o"${{ github.workspace }}" -y
 
       # ==========================================
-      # 4. 配置环境变量
+      # 6. 配置环境变量
       # ==========================================
       - name: Setup environment
         shell: pwsh
@@ -84,7 +98,7 @@ jobs:
           echo "QT_PLUGIN_PATH=$toolchainRoot\plugins" >> $env:GITHUB_ENV
 
       # ==========================================
-      # 4.5 诊断：确认实际使用的 CMake / Ninja 版本
+      # 6.5 诊断：确认实际使用的 CMake / Ninja 版本
       # ==========================================
       - name: Diagnose CMake and Ninja
         shell: pwsh
@@ -108,7 +122,7 @@ jobs:
           & "${{ github.workspace }}\RedPandaKit\bin\ninja.exe" --version
 
       # ==========================================
-      # 5. 编译与安装（强制使用工具链里的 CMake / Ninja）
+      # 7. 编译与安装（强制使用工具链里的 CMake / Ninja）
       # ==========================================
       - name: Configure, Build and Install
         shell: pwsh
@@ -145,7 +159,7 @@ jobs:
           & $cmake --install .
 
       # ==========================================
-      # 6. 获取版本号与打包
+      # 8. 获取版本号与打包
       # ==========================================
       - name: Determine tag name
         id: gettag
@@ -163,7 +177,7 @@ jobs:
           Compress-Archive -Path "${{ github.workspace }}\install\*" -DestinationPath "RedPanda-CPP-${{ steps.gettag.outputs.tag }}-win64.zip" -Force
 
       # ==========================================
-      # 7. 发布 Release
+      # 9. 发布 Release
       # ==========================================
       - name: Upload Release
         # 升级到 v3
