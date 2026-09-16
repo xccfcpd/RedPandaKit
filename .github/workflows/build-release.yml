@@ -45,18 +45,16 @@ jobs:
           path: kit
 
       # ==========================================
-      # 3. 合并分卷还原成完整的 RedPandaKit.7z
-      #    Windows 的 copy /b 可以二进制合并
+      # 3. 解压分卷 → 得到原始的 RedPandaKit.7z
+      #    注意：这一步不做 SHA256 校验，因为校验对象是里面的 RedPandaKit.7z
       # ==========================================
-      - name: Merge split archives
+      - name: Extract split archives
         shell: pwsh
         run: |
-          Write-Host "合并分卷..."
-          cmd /c copy /b "kit\toolchain\RedPandaKit-split.7z.001" + "kit\toolchain\RedPandaKit-split.7z.002" "RedPandaKit.7z"
-          Write-Host "合并完成"
+          & "C:\Program Files\7-Zip\7z.exe" x kit\toolchain\RedPandaKit-split.7z.001 -o"${{ github.workspace }}" -y
 
       # ==========================================
-      # 4. SHA256 校验（跟原来完全一致）
+      # 4. SHA256 校验（跟原来完全一致，校验 RedPandaKit.7z）
       # ==========================================
       - name: Verify SHA256 checksum
         shell: pwsh
@@ -79,7 +77,7 @@ jobs:
           }
 
       # ==========================================
-      # 5. 解压工具链（只有校验通过才会执行到此步）
+      # 5. 解压工具链（得到 RedPandaKit 目录）
       # ==========================================
       - name: Extract toolchain
         shell: pwsh
