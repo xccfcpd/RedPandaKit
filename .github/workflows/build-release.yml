@@ -46,12 +46,22 @@ jobs:
 
       # ==========================================
       # 3. 解压分卷 → 得到原始的 RedPandaKit.7z
-      #    注意：这一步不做 SHA256 校验，因为校验对象是里面的 RedPandaKit.7z
+      #    注意：7z 分卷里带了 toolchain\ 这一层目录，
+      #    所以解压后要把 RedPandaKit.7z 移到工作目录根部，
+      #    方便后续的 SHA256 校验和解压步骤直接访问。
       # ==========================================
       - name: Extract split archives
         shell: pwsh
         run: |
           & "C:\Program Files\7-Zip\7z.exe" x kit\toolchain\RedPandaKit-split.7z.001 -o"${{ github.workspace }}" -y
+
+          # 把 RedPandaKit.7z 从 toolchain\ 子目录移到工作目录根部
+          Move-Item "${{ github.workspace }}\toolchain\RedPandaKit.7z" "${{ github.workspace }}\RedPandaKit.7z" -Force
+
+          # 删除解压出来的临时 toolchain 目录（避免和 kit\toolchain 混淆）
+          Remove-Item "${{ github.workspace }}\toolchain" -Recurse -Force -ErrorAction SilentlyContinue
+
+          Write-Host "分卷解压完成，RedPandaKit.7z 已就位"
 
       # ==========================================
       # 4. SHA256 校验（跟原来完全一致，校验 RedPandaKit.7z）
