@@ -1,3 +1,7 @@
+# ============================================================
+# 执行结构：prepare → build（N 个并行）→ 每个 build 内部各自跑到 Upload Release
+# 好处 = 配置不手工维护 + 总耗时接近单分支 + 失败互不牵连 + 产物自动汇总到同一个 Release
+# ============================================================
 name: Build and Release RedPanda-CPP
 
 on:
@@ -19,10 +23,50 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  # ==========================================
+  # 0. 自动发现 RedPanda-CPP 远端所有分支，动态生成 matrix
+  #    避免手工维护分支列表时出现拼写错误或分支缺失
+  #    执行结构：prepare → build（N 个并行）→ 每个 build 内部各自跑到 Upload Release
+  #    好处 = 配置不手工维护 + 总耗时接近单分支 + 失败互不牵连 + 产物自动汇总到同一个 Release
+  # ==========================================
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      branches: ${{ steps.get-branches.outputs.branches }}
+    steps:
+      - name: List all branches of RedPanda-CPP
+        id: get-branches
+        shell: bash
+        run: |
+          # 用 git ls-remote 拉取远端所有分支名（不 clone，秒级完成）
+          branches=$(git ls-remote --heads https://github.com/xccfcpd/RedPanda-CPP.git \
+            | awk '{print $2}' \
+            | sed 's|refs/heads/||' \
+            | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "Discovered branches: $branches"
+          echo "branches=$branches" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: prepare   # 等 prepare 成功后再展开 matrix；prepare 负责发现分支，build 负责并行编译
     runs-on: windows-2022
 
+    # 多分支矩阵：分支列表由 prepare 步骤动态获取，无需手工维护
+    # N 个分支会并行构建，彼此独立，失败互不牵连（fail-fast: false）
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.prepare.outputs.branches) }}
+
     steps:
+      # ==========================================
+      # 0. 计算安全的分支名（把 / 替换为 -，避免 zip 路径出错）
+      # ==========================================
+      - name: Compute safe branch name
+        shell: pwsh
+        run: |
+          $safe = "${{ matrix.branch }}" -replace '/', '-'
+          echo "SAFE_BRANCH=$safe" >> $env:GITHUB_ENV
+
       # ==========================================
       # 1. Checkout 源码仓库
       # ==========================================
@@ -31,7 +75,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: 'xccfcpd/RedPanda-CPP'
-          ref: copied-master-plus
+          ref: ${{ matrix.branch }}
           fetch-depth: 0
           path: source
 
@@ -182,15 +226,17 @@ jobs:
       - name: Package artifacts
         shell: pwsh
         run: |
-          Compress-Archive -Path "${{ github.workspace }}\install\*" -DestinationPath "RedPanda-CPP-${{ steps.gettag.outputs.tag }}-win64.zip" -Force
+          Compress-Archive -Path "${{ github.workspace }}\install\*" -DestinationPath "RedPanda-CPP-${{ steps.gettag.outputs.tag }}-${{ env.SAFE_BRANCH }}-win64.zip" -Force
 
       # ==========================================
       # 9. 发布 Release
+      #    每个 build 内部各自跑到这里，softprops/action-gh-release 默认追加资源，
+      #    所以多个分支的产物会自动汇总到同一个 Release，互不覆盖。
       # ==========================================
       - name: Upload Release
         # 升级到 v3
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.gettag.outputs.tag }}
-          files: RedPanda-CPP-${{ steps.gettag.outputs.tag }}-win64.zip
+          files: RedPanda-CPP-${{ steps.gettag.outputs.tag }}-${{ env.SAFE_BRANCH }}-win64.zip
           token: ${{ secrets.GITHUB_TOKEN }}
