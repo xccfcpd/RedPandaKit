@@ -18,6 +18,15 @@ on:
 permissions:
   contents: write
 
+# ==========================================
+# 并发控制：同一个 tag 或分支只保留最新的运行任务
+# 避免重复 push tag / 手动触发 导致多个任务并发争抢 Release 资源
+# concurrency:  告诉 GitHub 我要开启“并发控制”功能。
+# ==========================================
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # 提前启用 Node.js 24 运行时，以消除弃用警告
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
