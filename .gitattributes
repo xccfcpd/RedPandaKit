@@ -1,0 +1,3 @@
+# 让 GitHub 自动生成的 Source code (zip/tar.gz) 排除工具链分卷
+# 不影响 actions/checkout 正常 clone，也不影响 workflow 解压编译
+toolchain/*.7z.* export-ignore
