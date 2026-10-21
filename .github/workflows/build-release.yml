@@ -203,13 +203,15 @@ jobs:
           cd build
 
           # 配置：显式指定 CMAKE_MAKE_PROGRAM 为工具链里的 ninja
+          # 链接参数只保留 -static；--strip-all 会让 7-Zip 无法按 PE 打开，
+          # 体积改由后面的 objcopy --strip-unneeded 控制。
           & $cmake -G Ninja `
                 -DCMAKE_MAKE_PROGRAM="$ninja" `
                 -DCMAKE_BUILD_TYPE=Release `
                 -DCMAKE_INSTALL_PREFIX="${{ github.workspace }}/install" `
                 "-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG" `
                 "-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG" `
-                "-DCMAKE_EXE_LINKER_FLAGS=-static -Wl,--strip-all" `
+                "-DCMAKE_EXE_LINKER_FLAGS=-static" `
                 -DCMAKE_PREFIX_PATH="$env:CMAKE_PREFIX_PATH" `
                 ..
 
@@ -218,6 +220,55 @@ jobs:
 
           # 安装
           & $cmake --install .
+
+      # ==========================================
+      # 7.5 去除不必要的符号
+      #
+      # --strip-all 会删掉 7-Zip 解析 PE 所需的信息；
+      # 使用 objcopy --strip-unneeded，体积接近且仍可被 7-Zip 打开。
+      # ==========================================
+      - name: Strip unnecessary symbols
+        shell: pwsh
+        run: |
+          $objcopy = "${{ github.workspace }}\RedPandaKit\bin\objcopy.exe"
+          $exe = "${{ github.workspace }}\install\RedPandaIDE.exe"
+
+          if (!(Test-Path $objcopy)) {
+            Write-Error "objcopy not found: $objcopy"
+            exit 1
+          }
+
+          if (!(Test-Path $exe)) {
+            Write-Error "RedPandaIDE.exe not found: $exe"
+            exit 1
+          }
+
+          & $objcopy --strip-unneeded $exe
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "objcopy failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+          Write-Host "Stripped: $exe"
+
+      # ==========================================
+      # 7.6 检查版本信息
+      #
+      # workflow 会构建所有分支，旧分支可能还没有 VERSIONINFO 改动，
+      # 因此这里只警告，不让旧分支构建失败。
+      # ==========================================
+      - name: Verify version information
+        shell: pwsh
+        run: |
+          $exe = "${{ github.workspace }}\install\RedPandaIDE.exe"
+          $info = (Get-Item $exe).VersionInfo
+
+          $info |
+            Format-List FileDescription, FileVersion, ProductName, ProductVersion, CompanyName, LegalCopyright
+
+          if ([string]::IsNullOrWhiteSpace($info.FileVersion)) {
+            Write-Warning "No FileVersion in $exe; this branch may not contain the VERSIONINFO change."
+          }
 
       # ==========================================
       # 8. 获取版本号与打包
