@@ -203,7 +203,7 @@ jobs:
           cd build
 
           # 配置：显式指定 CMAKE_MAKE_PROGRAM 为工具链里的 ninja
-          # 链接参数只保留 -static；--strip-all 会让 7-Zip 无法按 PE 打开，
+          # 链接参数只保留 -static；--strip-all 会导致 7-Zip 无法按 PE 打开，
           # 体积改由后面的 objcopy --strip-unneeded 控制。
           & $cmake -G Ninja `
                 -DCMAKE_MAKE_PROGRAM="$ninja" `
@@ -226,30 +226,46 @@ jobs:
       #
       # --strip-all 会删掉 7-Zip 解析 PE 所需的信息；
       # 使用 objcopy --strip-unneeded，体积接近且仍可被 7-Zip 打开。
+      #
+      # 递归处理 install 目录下的所有 exe，
+      # 包括 RedPandaIDE.exe、consolepauser.exe 以及其他子目录中的 exe。
       # ==========================================
       - name: Strip unnecessary symbols
         shell: pwsh
         run: |
           $objcopy = "${{ github.workspace }}\RedPandaKit\bin\objcopy.exe"
-          $exe = "${{ github.workspace }}\install\RedPandaIDE.exe"
+          $installDir = "${{ github.workspace }}\install"
 
           if (!(Test-Path $objcopy)) {
             Write-Error "objcopy not found: $objcopy"
             exit 1
           }
 
-          if (!(Test-Path $exe)) {
-            Write-Error "RedPandaIDE.exe not found: $exe"
+          if (!(Test-Path $installDir)) {
+            Write-Error "install directory not found: $installDir"
             exit 1
           }
 
-          & $objcopy --strip-unneeded $exe
-          if ($LASTEXITCODE -ne 0) {
-            Write-Error "objcopy failed with exit code $LASTEXITCODE"
-            exit $LASTEXITCODE
+          # 递归收集所有 exe，避免漏掉 consolepauser 或子目录里的工具
+          $exes = @(Get-ChildItem -Path $installDir -Filter '*.exe' -File -Recurse)
+          if ($exes.Count -eq 0) {
+            Write-Error "No .exe found under: $installDir"
+            exit 1
           }
 
-          Write-Host "Stripped: $exe"
+          foreach ($exe in $exes) {
+            Write-Host "Stripping: $($exe.FullName)"
+            & $objcopy --strip-unneeded $exe.FullName
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "objcopy failed for $($exe.FullName), exit code $LASTEXITCODE"
+              exit $LASTEXITCODE
+            }
+
+            Write-Host "Stripped: $($exe.FullName)"
+          }
+
+          Write-Host "All executables stripped successfully."
 
       # ==========================================
       # 7.6 检查版本信息
