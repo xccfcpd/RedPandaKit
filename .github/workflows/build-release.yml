@@ -1,6 +1,14 @@
 # ============================================================
-# 执行结构：prepare → build（N 个并行）→ 每个 build 内部各自跑到 Upload Release
+# 执行结构：prepare → build-qt5 / build-qt6（各自 N 个并行）→ 内部跑到 Upload Release
 # 好处 = 配置不手工维护 + 总耗时接近单分支 + 失败互不牵连 + 产物自动汇总到同一个 Release
+#
+# 两条编译线：
+#   build-qt5  老工具链（本仓库 toolchain/RedPandaKit-split.7z.*，GCC 8.5 + Qt 5.15.19 静态）
+#              保留原行为，产物名不变（*-win64.zip）
+#   build-qt6  新工具链（GCC 14.4 UCRT + Qt 6.8.5 静态，走 GitHub Release 下载）
+#              CMake/Ninja 用 runner 自带的，不再解压整套 150MB 工具链
+#              同样默认编所有分支（可用 qt6_branches 输入缩小范围）
+#              产物名带 -qt6 后缀，避免和 Qt5 产物冲突
 # ============================================================
 name: Build and Release RedPanda-CPP
 
@@ -14,6 +22,10 @@ on:
         description: 'Release tag name (e.g. v1.0.0)'
         required: true
         default: 'v1.0.0'
+      qt6_branches:
+        description: '只构建这些分支的 Qt6 版本（逗号分隔；留空 = 所有分支）'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -21,7 +33,6 @@ permissions:
 # ==========================================
 # 并发控制：同一个 tag 或分支只保留最新的运行任务
 # 避免重复 push tag / 手动触发 导致多个任务并发争抢 Release 资源
-# concurrency:  告诉 GitHub 我要开启“并发控制”功能。
 # ==========================================
 concurrency:
   group: release-${{ github.ref }}
@@ -31,17 +42,32 @@ env:
   # 提前启用 Node.js 24 运行时，以消除弃用警告
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+  # ---------- Qt6 编译线固定版本（改动这里即可整体升级） ----------
+  QT6_VERSION: '6.8.5'
+  QT6_ARCHIVE: 'Qt_6.8.5-static-Release_mingw1440_64_UCRT.7z'
+  QT6_URL: 'https://github.com/xccfcpd/qt68lts-static/releases/download/Qt_6.8.5-static-Release_mingw1440_64_UCRT/Qt_6.8.5-static-Release_mingw1440_64_UCRT.7z'
+  QT6_SHA256: '39f24f4038108b5b37e243c87883e9dad813b1d8a1c66b28923bd91e6b17533b'
+  QT6_DIRNAME: 'mingw1440_64_UCRT'
+
+  MINGW_VERSION: '14.4.0-r1.1'
+  MINGW_ARCHIVE: 'mingw64-ucrt-14.4.0-r1.1.7z'
+  MINGW_URL: 'https://github.com/xccfcpd/mingw-lite/releases/download/14.4-v1.1/mingw64-ucrt-14.4.0-r1.1.7z'
+  MINGW_SHA256: '057e2248c5758a58d3699e8d3e516c21447500c8931693cbb7f6a481b6f0ed17'
+  MINGW_DIRNAME: 'mingw64-ucrt-14'
+
+  # ---------- Qt5 编译线（本仓库内置工具链） ----------
+  KIT_SHA256: 'f50f0da6bf7911e20773fc164ec9f29455b9cf5913d794876acb7c5d78250d88'
+
 jobs:
   # ==========================================
   # 0. 自动发现 RedPanda-CPP 远端所有分支，动态生成 matrix
   #    避免手工维护分支列表时出现拼写错误或分支缺失
-  #    执行结构：prepare → build（N 个并行）→ 每个 build 内部各自跑到 Upload Release
-  #    好处 = 配置不手工维护 + 总耗时接近单分支 + 失败互不牵连 + 产物自动汇总到同一个 Release
   # ==========================================
   prepare:
     runs-on: ubuntu-latest
     outputs:
       branches: ${{ steps.get-branches.outputs.branches }}
+      qt6_branches: ${{ steps.get-branches.outputs.qt6_branches }}
     steps:
       - name: List all branches of RedPanda-CPP
         id: get-branches
@@ -55,7 +81,28 @@ jobs:
           echo "Discovered branches: $branches"
           echo "branches=$branches" >> "$GITHUB_OUTPUT"
 
-  build:
+          # Qt6 分支：与 Qt5 一致，默认编远端所有分支；
+          # 若手动填了列表，则只编列表里的分支，并与远端真实分支取交集，
+          # 防止某个分支被删除后 matrix 里留下死项。
+          qt6_input="${{ github.event.inputs.qt6_branches }}"
+          if [ -z "$qt6_input" ]; then
+            qt6_branches="$branches"
+          else
+            qt6_branches=$(printf '%s' "$qt6_input" \
+              | tr ',' '\n' \
+              | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+              | jq -R -s -c --argjson all "$branches" \
+                  'split("\n") | map(select(length > 0)) | map(select(. as $b | any($all[]; . == $b)))')
+          fi
+          echo "Qt6 branches: $qt6_branches"
+          echo "qt6_branches=$qt6_branches" >> "$GITHUB_OUTPUT"
+
+  # ==========================================
+  # 1. Qt 5 编译线（保留原样：GCC 8.5 + Qt 5.15.19 静态工具链）
+  #    只加了一层缓存：命中后直接复用解压好的 RedPandaKit，省掉
+  #    每次 150MB 分卷解压 + 1GB 二次解压的时间。
+  # ==========================================
+  build-qt5:
     needs: prepare   # 等 prepare 成功后再展开 matrix；prepare 负责发现分支，build 负责并行编译
     runs-on: windows-2022
 
@@ -80,7 +127,6 @@ jobs:
       # 1. Checkout 源码仓库
       # ==========================================
       - name: Checkout RedPanda-CPP source
-        # 升级到 v5
         uses: actions/checkout@v5
         with:
           repository: 'xccfcpd/RedPanda-CPP'
@@ -98,12 +144,23 @@ jobs:
           path: kit
 
       # ==========================================
-      # 3. 解压分卷 → 得到原始的 RedPandaKit.7z
+      # 3. 恢复工具链缓存（key 绑死工具链 SHA256，工具链一变缓存自动失效）
+      # ==========================================
+      - name: Restore toolchain cache
+        id: kit-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}\RedPandaKit
+          key: rpkit-toolchain-${{ env.KIT_SHA256 }}
+
+      # ==========================================
+      # 4. 解压分卷 → 得到原始的 RedPandaKit.7z
       #    注意：7z 分卷里带了 toolchain\ 这一层目录，
       #    所以解压后要把 RedPandaKit.7z 移到工作目录根部，
       #    方便后续的 SHA256 校验和解压步骤直接访问。
       # ==========================================
       - name: Extract split archives
+        if: steps.kit-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           & "C:\Program Files\7-Zip\7z.exe" x kit\toolchain\RedPandaKit-split.7z.001 -o"${{ github.workspace }}" -y
@@ -117,13 +174,14 @@ jobs:
           Write-Host "分卷解压完成，RedPandaKit.7z 已就位"
 
       # ==========================================
-      # 4. SHA256 校验（跟原来完全一致，校验 RedPandaKit.7z）
+      # 5. SHA256 校验（跟原来完全一致，校验 RedPandaKit.7z）
       # ==========================================
       - name: Verify SHA256 checksum
+        if: steps.kit-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          # 重要提示：RedPandaKit.7z的真实 SHA256 哈希值！
-          $expectedHash = "f50f0da6bf7911e20773fc164ec9f29455b9cf5913d794876acb7c5d78250d88"
+          # 重要提示：RedPandaKit.7z的真实 SHA256 哈希值！（常量见 workflow 顶部 KIT_SHA256）
+          $expectedHash = "${{ env.KIT_SHA256 }}"
 
           # 计算合并后文件的哈希值
           $actualHash = (Get-FileHash -Path "RedPandaKit.7z" -Algorithm SHA256).Hash
@@ -140,15 +198,19 @@ jobs:
           }
 
       # ==========================================
-      # 5. 解压工具链（得到 RedPandaKit 目录）
+      # 6. 解压工具链（得到 RedPandaKit 目录）
       # ==========================================
       - name: Extract toolchain
+        if: steps.kit-cache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
-          & "C:\Program Files\7-Zip\7z.exe" x RedPandaKit.7z -o"${{ github.workspace }}" -y
+          & "C:\Program Files\7-Zip\7z.exe" x RedPandaKit.7z -o"${{ github.workspace }}" -y -mmt=on
+
+          # 中间产物不再需要，删掉省磁盘
+          Remove-Item "${{ github.workspace }}\RedPandaKit.7z" -Force -ErrorAction SilentlyContinue
 
       # ==========================================
-      # 6. 配置环境变量
+      # 7. 配置环境变量
       # ==========================================
       - name: Setup environment
         shell: pwsh
@@ -159,7 +221,7 @@ jobs:
           echo "QT_PLUGIN_PATH=$toolchainRoot\plugins" >> $env:GITHUB_ENV
 
       # ==========================================
-      # 6.5 诊断：确认实际使用的 CMake / Ninja 版本
+      # 8. 诊断：确认实际使用的 CMake / Ninja 版本
       # ==========================================
       - name: Diagnose CMake and Ninja
         shell: pwsh
@@ -183,7 +245,7 @@ jobs:
           & "${{ github.workspace }}\RedPandaKit\bin\ninja.exe" --version
 
       # ==========================================
-      # 7. 编译与安装（强制使用工具链里的 CMake / Ninja）
+      # 9. 编译与安装（使用工具链里的 CMake / Ninja）
       # ==========================================
       - name: Configure, Build and Install
         shell: pwsh
@@ -222,13 +284,10 @@ jobs:
           & $cmake --install .
 
       # ==========================================
-      # 7.5 去除不必要的符号
+      # 10. 去除不必要的符号
       #
       # --strip-all 会删掉 7-Zip 解析 PE 所需的信息；
       # 使用 objcopy --strip-unneeded，体积接近且仍可被 7-Zip 打开。
-      #
-      # 递归处理 install 目录下的所有 exe，
-      # 包括 RedPandaIDE.exe、consolepauser.exe 以及其他子目录中的 exe。
       # ==========================================
       - name: Strip unnecessary symbols
         shell: pwsh
@@ -268,7 +327,7 @@ jobs:
           Write-Host "All executables stripped successfully."
 
       # ==========================================
-      # 7.6 检查版本信息
+      # 11. 检查版本信息
       #
       # workflow 会构建所有分支，旧分支可能还没有 VERSIONINFO 改动，
       # 因此这里只警告，不让旧分支构建失败。
@@ -287,7 +346,7 @@ jobs:
           }
 
       # ==========================================
-      # 8. 获取版本号与打包
+      # 12. 获取版本号与打包
       # ==========================================
       - name: Determine tag name
         id: gettag
@@ -305,14 +364,305 @@ jobs:
           Compress-Archive -Path "${{ github.workspace }}\install\*" -DestinationPath "RedPanda-CPP-${{ steps.gettag.outputs.tag }}-${{ env.SAFE_BRANCH }}-win64.zip" -Force
 
       # ==========================================
-      # 9. 发布 Release
-      #    每个 build 内部各自跑到这里，softprops/action-gh-release 默认追加资源，
-      #    所以多个分支的产物会自动汇总到同一个 Release，互不覆盖。
+      # 13. 发布 Release
+      #     每个 build 内部各自跑到这里，softprops/action-gh-release 默认追加资源，
+      #     所以多个分支的产物会自动汇总到同一个 Release，互不覆盖。
       # ==========================================
       - name: Upload Release
-        # 升级到 v3
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.gettag.outputs.tag }}
           files: RedPanda-CPP-${{ steps.gettag.outputs.tag }}-${{ env.SAFE_BRANCH }}-win64.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ==========================================
+  # 2. Qt 6 编译线（Qt 6.8.5 静态 + GCC 14.4 UCRT，CMake/Ninja 用 runner 自带的）
+  #    - 只下载 51MB 的 mingw-lite + 279MB 的 Qt 静态包，压缩包走 actions/cache
+  #    - 不再 checkout / 解压 150MB 的内置工具链
+  #    - 产物名带 -qt6，和 Qt5 产物共存于同一个 Release
+  # ==========================================
+  build-qt6:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.qt6_branches != '' && needs.prepare.outputs.qt6_branches != '[]' }}
+    runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJSON(needs.prepare.outputs.qt6_branches) }}
+
+    # 工具链解压目录（runner 临时盘，避免污染工作区）。
+    # 注意：runner 上下文在 job 级 env 里不可用，所以各步骤自己用
+    # $env:RUNNER_TEMP 拼路径，不能写成 job 级 env。
+    steps:
+      - name: Compute safe branch name
+        shell: pwsh
+        run: |
+          $safe = "${{ matrix.branch }}" -replace '/', '-'
+          echo "SAFE_BRANCH=$safe" >> $env:GITHUB_ENV
+
+      # ==========================================
+      # 1. Checkout 源码仓库（Qt6 线不需要 kit 仓库）
+      # ==========================================
+      - name: Checkout RedPanda-CPP source
+        uses: actions/checkout@v5
+        with:
+          repository: 'xccfcpd/RedPanda-CPP'
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+          path: source
+
+      # ==========================================
+      # 2. 缓存两个压缩包（命中就跳过 330MB 下载）
+      # ==========================================
+      - name: Restore toolchain archives cache
+        id: archive-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}\rpkit\${{ env.MINGW_ARCHIVE }}
+            ${{ runner.temp }}\rpkit\${{ env.QT6_ARCHIVE }}
+          key: rpkit-qt6-${{ env.QT6_VERSION }}-mingw${{ env.MINGW_VERSION }}
+
+      - name: Download toolchain archives
+        if: steps.archive-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP\rpkit"
+          New-Item -ItemType Directory -Force -Path $root | Out-Null
+
+          $downloads = @(
+            @{ Url = "${{ env.MINGW_URL }}"; File = "$root\${{ env.MINGW_ARCHIVE }}" },
+            @{ Url = "${{ env.QT6_URL }}";   File = "$root\${{ env.QT6_ARCHIVE }}" }
+          )
+
+          # 并行下载，两个包互不依赖
+          $jobs = foreach ($d in $downloads) {
+            Start-Job -ScriptBlock {
+              param($url, $out)
+              curl.exe -sS -L --retry 3 --retry-delay 5 -o $out $url
+              if ($LASTEXITCODE -ne 0) { throw "download failed: $url" }
+            } -ArgumentList $d.Url, $d.File
+          }
+          $jobs | Wait-Job | Out-Null
+
+          $failed = @($jobs | Where-Object { $_.State -ne 'Completed' })
+          $jobs | Receive-Job
+          $jobs | Remove-Job
+
+          if ($failed.Count -gt 0) {
+            Write-Error "下载失败（$($failed.Count) 个任务），请检查网络或 URL"
+            exit 1
+          }
+
+      # ==========================================
+      # 3. SHA256 校验（两个包都按固定哈希校验，防止半包/被篡改）
+      # ==========================================
+      - name: Verify SHA256 checksums
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP\rpkit"
+          $expected = @{
+            "${{ env.MINGW_ARCHIVE }}" = "${{ env.MINGW_SHA256 }}"
+            "${{ env.QT6_ARCHIVE }}"   = "${{ env.QT6_SHA256 }}"
+          }
+
+          foreach ($name in $expected.Keys) {
+            $path = Join-Path $root $name
+            if (!(Test-Path $path)) { Write-Error "missing archive: $path"; exit 1 }
+
+            $actual = (Get-FileHash -Path $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-Host "$name"
+            Write-Host "  expected: $($expected[$name])"
+            Write-Host "  actual:   $actual"
+
+            if ($actual -ne $expected[$name]) {
+              Write-Error "SHA256 mismatch: $name"
+              exit 1
+            }
+          }
+          Write-Host "SHA256 校验通过！"
+
+      # ==========================================
+      # 4. 解压工具链（-mmt=on 多线程，LZMA2 大包解压快一截）
+      # ==========================================
+      - name: Extract toolchains
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP\rpkit"
+
+          & "C:\Program Files\7-Zip\7z.exe" x "$root\${{ env.MINGW_ARCHIVE }}" -o"$root" -y -mmt=on
+          if ($LASTEXITCODE -ne 0) { Write-Error "failed to extract MinGW"; exit 1 }
+
+          & "C:\Program Files\7-Zip\7z.exe" x "$root\${{ env.QT6_ARCHIVE }}" -o"$root" -y -mmt=on
+          if ($LASTEXITCODE -ne 0) { Write-Error "failed to extract Qt"; exit 1 }
+
+          if (!(Test-Path "$root\${{ env.MINGW_DIRNAME }}\bin\g++.exe")) {
+            Write-Error "g++.exe not found in $root\${{ env.MINGW_DIRNAME }}"
+            exit 1
+          }
+          if (!(Test-Path "$root\${{ env.QT6_DIRNAME }}\lib\cmake\Qt6\Qt6Config.cmake")) {
+            Write-Error "Qt6Config.cmake not found in $root\${{ env.QT6_DIRNAME }}"
+            exit 1
+          }
+
+      # ==========================================
+      # 5. 配置环境变量（只把 MinGW 加进 PATH，CMake/Ninja 用 runner 自带的）
+      # ==========================================
+      - name: Setup environment
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP\rpkit"
+          $mingw = "$root\${{ env.MINGW_DIRNAME }}"
+          $qt = "$root\${{ env.QT6_DIRNAME }}"
+
+          echo "$mingw\bin" >> $env:GITHUB_PATH
+          echo "MINGW_ROOT=$mingw" >> $env:GITHUB_ENV
+          echo "QT6_ROOT=$qt" >> $env:GITHUB_ENV
+          echo "QT_PLUGIN_PATH=$qt\plugins" >> $env:GITHUB_ENV
+
+      # ==========================================
+      # 6. 诊断：确认 CMake / Ninja 是 runner 自带的，GCC 是新工具链的
+      # ==========================================
+      - name: Diagnose toolchain
+        shell: pwsh
+        run: |
+          Write-Host "===== cmake ====="
+          where.exe cmake
+          cmake --version
+          Write-Host ""
+          Write-Host "===== ninja ====="
+          where.exe ninja
+          ninja --version
+          Write-Host ""
+          Write-Host "===== gcc ====="
+          gcc --version | Select-Object -First 1
+          Write-Host ""
+          Write-Host "===== Qt ====="
+          Write-Host "QT6_ROOT=$env:QT6_ROOT"
+          & "$env:QT6_ROOT\bin\lrelease.exe" -version
+
+      # ==========================================
+      # 7. 编译与安装
+      # ==========================================
+      - name: Configure, Build and Install
+        shell: pwsh
+        working-directory: source
+        run: |
+          # CMake 写出的脚本里反斜杠是转义字符：像 D:\a\_temp\... 会被当成
+          # \a 转义，报 "Invalid character escape '\a'"。这里统一转成正斜杠。
+          $mingwBin = ("$env:MINGW_ROOT\bin" -replace '\\', '/')
+          $cc = "$mingwBin/gcc.exe"
+          $cxx = "$mingwBin/g++.exe"
+          $rc = "$mingwBin/windres.exe"
+          $qt6 = ($env:QT6_ROOT -replace '\\', '/')
+          $install = ("${{ github.workspace }}\install" -replace '\\', '/')
+
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          Push-Location build
+
+          # 链接参数同样只保留 -static，strip 由后面的 objcopy --strip-unneeded 负责
+          cmake -G Ninja `
+                -DCMAKE_BUILD_TYPE=Release `
+                -DCMAKE_C_COMPILER="$cc" `
+                -DCMAKE_CXX_COMPILER="$cxx" `
+                -DCMAKE_RC_COMPILER="$rc" `
+                -DCMAKE_INSTALL_PREFIX="$install" `
+                "-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG" `
+                "-DCMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG" `
+                "-DCMAKE_EXE_LINKER_FLAGS=-static" `
+                -DCMAKE_PREFIX_PATH="$qt6" `
+                ..
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+
+          cmake --build . -j $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+
+          cmake --install .
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+
+          Pop-Location
+
+      # ==========================================
+      # 8. 去除不必要的符号（--strip-all 会让 7-Zip 无法解析 PE）
+      # ==========================================
+      - name: Strip unnecessary symbols
+        shell: pwsh
+        run: |
+          $objcopy = "$env:MINGW_ROOT\bin\objcopy.exe"
+          $installDir = "${{ github.workspace }}\install"
+
+          if (!(Test-Path $objcopy)) {
+            Write-Error "objcopy not found: $objcopy"
+            exit 1
+          }
+
+          if (!(Test-Path $installDir)) {
+            Write-Error "install directory not found: $installDir"
+            exit 1
+          }
+
+          # 递归收集所有 exe，避免漏掉 consolepauser 或子目录里的工具
+          $exes = @(Get-ChildItem -Path $installDir -Filter '*.exe' -File -Recurse)
+          if ($exes.Count -eq 0) {
+            Write-Error "No .exe found under: $installDir"
+            exit 1
+          }
+
+          foreach ($exe in $exes) {
+            Write-Host "Stripping: $($exe.FullName)"
+            & $objcopy --strip-unneeded $exe.FullName
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "objcopy failed for $($exe.FullName), exit code $LASTEXITCODE"
+              exit $LASTEXITCODE
+            }
+
+            Write-Host "Stripped: $($exe.FullName)"
+          }
+
+          Write-Host "All executables stripped successfully."
+
+      # ==========================================
+      # 9. 检查版本信息
+      # ==========================================
+      - name: Verify version information
+        shell: pwsh
+        run: |
+          $exe = "${{ github.workspace }}\install\RedPandaIDE.exe"
+          $info = (Get-Item $exe).VersionInfo
+
+          $info |
+            Format-List FileDescription, FileVersion, ProductName, ProductVersion, CompanyName, LegalCopyright
+
+          if ([string]::IsNullOrWhiteSpace($info.FileVersion)) {
+            Write-Warning "No FileVersion in $exe; this branch may not contain the VERSIONINFO change."
+          }
+
+      # ==========================================
+      # 10. 获取版本号与打包
+      # ==========================================
+      - name: Determine tag name
+        id: gettag
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            echo "tag=${{ github.event.inputs.tag_name }}" >> $env:GITHUB_OUTPUT
+          } else {
+            echo "tag=${{ github.ref_name }}" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Package artifacts
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "${{ github.workspace }}\install\*" -DestinationPath "RedPanda-CPP-${{ steps.gettag.outputs.tag }}-${{ env.SAFE_BRANCH }}-win64-qt6.zip" -Force
+
+      # ==========================================
+      # 11. 发布 Release（与 Qt5 产物追加到同一个 Release）
+      # ==========================================
+      - name: Upload Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.gettag.outputs.tag }}
+          files: RedPanda-CPP-${{ steps.gettag.outputs.tag }}-${{ env.SAFE_BRANCH }}-win64-qt6.zip
           token: ${{ secrets.GITHUB_TOKEN }}
